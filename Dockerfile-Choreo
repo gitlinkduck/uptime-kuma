@@ -1,2 +1,2 @@
-FROM louislam/uptime-kuma:2
+FROM docker pull louislam/uptime-kuma:beta-rootless
 USER 10014
