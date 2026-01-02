@@ -26,8 +26,40 @@ RUN echo 'package main' > healthcheck.go && \
     go build -ldflags="-w -s" -trimpath -o healthcheck healthcheck.go
 
 FROM louislam/uptime-kuma:beta-rootless
+
 USER root
+
+# 安装 cloudflared
+RUN apt-get update && \
+    apt-get install -y curl && \
+    curl -LO https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && \
+    chmod +x cloudflared-linux-amd64 && \
+    mv cloudflared-linux-amd64 /usr/local/bin/cloudflared && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 替换 healthcheck
 COPY --from=healthcheck-builder /build/healthcheck /app/extra/healthcheck
 RUN chmod +x /app/extra/healthcheck && \
     chown 10014:10014 /app/extra/healthcheck
+
+# 创建启动脚本
+RUN echo '#!/bin/bash' > /start.sh && \
+    echo '' >> /start.sh && \
+    echo '# 启动 cloudflared（如果设置了 token）' >> /start.sh && \
+    echo 'if [ -n "$CLOUDFLARED_TOKEN" ]; then' >> /start.sh && \
+    echo '    echo "Starting cloudflared tunnel..."' >> /start.sh && \
+    echo '    cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TOKEN" &' >> /start.sh && \
+    echo 'fi' >> /start.sh && \
+    echo '' >> /start.sh && \
+    echo '# 启动 uptime-kuma' >> /start.sh && \
+    echo 'echo "Starting Uptime Kuma..."' >> /start.sh && \
+    echo 'cd /app' >> /start.sh && \
+    echo 'exec node server/server.js' >> /start.sh && \
+    chmod +x /start.sh
+
 USER 10014
+
+ENV CLOUDFLARED_TOKEN=""
+
+CMD ["/start.sh"]
