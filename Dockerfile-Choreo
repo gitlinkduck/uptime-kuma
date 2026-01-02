@@ -1,0 +1,2 @@
+FROM louislam/uptime-kuma:2
+USER 10014
