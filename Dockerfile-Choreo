@@ -1,65 +1,72 @@
+# 阶段1：构建健康检查二进制文件（使用静态链接）
 FROM golang:1.22.4-alpine AS healthcheck-builder
 WORKDIR /build
-RUN echo 'package main' > healthcheck.go && \
-    echo '' >> healthcheck.go && \
-    echo 'import (' >> healthcheck.go && \
-    echo '    "fmt"' >> healthcheck.go && \
-    echo '    "net/http"' >> healthcheck.go && \
-    echo '    "os"' >> healthcheck.go && \
-    echo '    "time"' >> healthcheck.go && \
-    echo ')' >> healthcheck.go && \
-    echo '' >> healthcheck.go && \
-    echo 'func main() {' >> healthcheck.go && \
-    echo '    client := &http.Client{Timeout: 10 * time.Second}' >> healthcheck.go && \
-    echo '    resp, err := client.Get("http://localhost:3001")' >> healthcheck.go && \
-    echo '    if err != nil {' >> healthcheck.go && \
-    echo '        fmt.Fprintf(os.Stderr, "Health check failed: %v\\n", err)' >> healthcheck.go && \
-    echo '        os.Exit(1)' >> healthcheck.go && \
-    echo '    }' >> healthcheck.go && \
-    echo '    defer resp.Body.Close()' >> healthcheck.go && \
-    echo '    if resp.StatusCode != 200 {' >> healthcheck.go && \
-    echo '        fmt.Fprintf(os.Stderr, "Unexpected status code: %d\\n", resp.StatusCode)' >> healthcheck.go && \
-    echo '        os.Exit(1)' >> healthcheck.go && \
-    echo '    }' >> healthcheck.go && \
-    echo '    fmt.Println("Health check passed")' >> healthcheck.go && \
-    echo '}' >> healthcheck.go && \
-    go build -ldflags="-w -s" -trimpath -o healthcheck healthcheck.go
 
+# 优化：使用 printf 替代多层 echo，并改为 /health 端点（Uptime Kuma 标准健康检查路径）
+RUN printf 'package main\n\nimport (\n\t"fmt"\n\t"net/http"\n\t"os"\n\t"time"\n)\n\nfunc main() {\n\tclient := &http.Client{Timeout: 10 * time.Second}\n\tresp, err := client.Get("http://localhost:3001/health")\n\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, "Health check failed: %%v\\n", err)\n\t\tos.Exit(1)\n\t}\n\tdefer resp.Body.Close()\n\tif resp.StatusCode != 200 {\n\t\tfmt.Fprintf(os.Stderr, "Unexpected status code: %%d\\n", resp.StatusCode)\n\t\tos.Exit(1)\n\t}\n\tfmt.Println("Health check passed")\n}\n' > healthcheck.go && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -trimpath -a -installsuffix cgo -o healthcheck healthcheck.go
+
+# 阶段2：最终镜像
 FROM louislam/uptime-kuma:beta-rootless
 
 USER root
 
-# 安装 cloudflared
+# 关键修复：升级 OpenSSL 和 libssl3 修复 CVE-2025-15467
+# 使用 latest 下载 cloudflared（不固定版本）
 RUN apt-get update && \
-    apt-get install -y curl && \
-    curl -LO https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && \
-    chmod +x cloudflared-linux-amd64 && \
-    mv cloudflared-linux-amd64 /usr/local/bin/cloudflared && \
+    apt-get upgrade -y libssl3 openssl && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared && \
+    cloudflared version && \
+    apt-get purge -y curl && \
+    apt-get autoremove -y && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# 替换 healthcheck
-COPY --from=healthcheck-builder /build/healthcheck /app/extra/healthcheck
-RUN chmod +x /app/extra/healthcheck && \
-    chown 10014:10014 /app/extra/healthcheck
+# 复制健康检查工具（使用非 root 用户权限）
+COPY --from=healthcheck-builder --chown=10014:10014 /build/healthcheck /app/extra/healthcheck
+RUN chmod +x /app/extra/healthcheck
 
-# 创建启动脚本
-RUN echo '#!/bin/bash' > /start.sh && \
-    echo '' >> /start.sh && \
-    echo '# 启动 cloudflared（如果设置了 token）' >> /start.sh && \
-    echo 'if [ -n "$CLOUDFLARED_TOKEN" ]; then' >> /start.sh && \
-    echo '    echo "Starting cloudflared tunnel..."' >> /start.sh && \
-    echo '    cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TOKEN" &' >> /start.sh && \
-    echo 'fi' >> /start.sh && \
-    echo '' >> /start.sh && \
-    echo '# 启动 uptime-kuma' >> /start.sh && \
-    echo 'echo "Starting Uptime Kuma..."' >> /start.sh && \
-    echo 'cd /app' >> /start.sh && \
-    echo 'exec node server/server.js' >> /start.sh && \
-    chmod +x /start.sh
+# 优化启动脚本：添加信号处理、日志时间戳、错误处理
+RUN cat > /start.sh << 'EOF'
+#!/bin/bash
+set -e
+
+cleanup() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Received shutdown signal..."
+    if [ -n "$CLOUDFLARED_PID" ]; then
+        kill $CLOUDFLARED_PID 2>/dev/null || true
+        wait $CLOUDFLARED_PID 2>/dev/null || true
+    fi
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# 启动 cloudflared（如果设置了 token）
+if [ -n "$CLOUDFLARED_TOKEN" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting cloudflared tunnel..."
+    cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TOKEN" &
+    CLOUDFLARED_PID=$!
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cloudflared started with PID $CLOUDFLARED_PID"
+fi
+
+# 启动 uptime-kuma
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Uptime Kuma..."
+cd /app
+exec node server/server.js
+EOF
+RUN chmod +x /start.sh
+
+# 添加 Docker 原生健康检查（使用构建的健康检查工具）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD /app/extra/healthcheck || exit 1
 
 USER 10014
 
 ENV CLOUDFLARED_TOKEN=""
+
+EXPOSE 3001
 
 CMD ["/start.sh"]
