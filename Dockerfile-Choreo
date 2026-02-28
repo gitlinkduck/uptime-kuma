@@ -1,5 +1,5 @@
 # 阶段1：构建健康检查二进制文件（使用静态链接）
-FROM browseruse/web-ui:latest
+FROM ghcr.io/browser-use/web-ui
 
 USER 10014
 
